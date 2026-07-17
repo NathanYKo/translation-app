@@ -1,5 +1,5 @@
 // Realtime English<->Chinese voice translator
-// Streaming STT (Deepgram via WebSocket) + OpenRouter LLM + Streaming TTS (ElevenLabs)
+// Streaming STT (Deepgram via SSE+fetch) + OpenRouter LLM + Streaming TTS (ElevenLabs)
 
 const overlay = document.getElementById('start');
 const langEl = document.getElementById('lang');
@@ -40,10 +40,11 @@ let audioCtx = null;
 let analyser = null;
 let vadRAF = null;
 
-// Streaming STT state
-let wsStt = null;
-let wsTranscript = '';
-let wsResolve = null;
+// Streaming STT state (SSE-based)
+let sttSessionId = null;
+let sttEventSource = null;
+let sttTranscript = '';
+let sttResolve = null;
 
 function updateLangUI() {
   const isEn = expectLang === 'en';
@@ -68,8 +69,7 @@ function togglePause() {
       try { mediaRecorder.stop(); } catch {}
     }
     audioChunks = [];
-    if (wsStt && wsStt.readyState === WebSocket.OPEN) wsStt.close();
-    wsStt = null;
+    closeSttSession();
     pulseEl.style.setProperty('--vol', 0);
     setState('paused', 'Paused — click the circle to resume');
     interimEl.textContent = '';
@@ -130,45 +130,64 @@ const MIN_SPEECH_MS = 400;
 const MIN_BLOB_BYTES = 3000;
 const NO_SPEECH_TIMEOUT = 30000;
 
-// ── Streaming STT (WebSocket) ───────────────────────────────────────────────
+// ── Streaming STT (SSE + fetch — works in all browsers) ─────────────────────
 
-function connectSttWebSocket() {
+function closeSttSession() {
+  if (sttEventSource) { sttEventSource.close(); sttEventSource = null; }
+  sttSessionId = null;
+}
+
+function openSttSSE() {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`/ws?lang=${expectLang}`);
+    const es = new EventSource('/stt-sse?lang=' + expectLang);
+    let resolved = false;
 
-    ws.onopen = () => {
-      log('STT WebSocket connected');
-      resolve(ws);
-    };
-
-    ws.onmessage = (event) => {
+    es.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        if (data.type === 'transcript') {
+        if (data.type === 'session') {
+          sttSessionId = data.sessionId;
+          log('STT session: ' + sttSessionId.slice(0, 8) + '…');
+          if (!resolved) { resolved = true; resolve(es); }
+        } else if (data.type === 'transcript') {
           interimEl.textContent = data.text;
           interimEl.classList.add('active');
-          if (data.isFinal) wsTranscript = data.text;
+          if (data.isFinal) sttTranscript = data.text;
         } else if (data.type === 'final') {
-          wsTranscript = data.text;
-          if (wsResolve) { wsResolve(wsTranscript); wsResolve = null; }
+          sttTranscript = data.text;
+          if (sttResolve) { sttResolve(sttTranscript); sttResolve = null; }
         } else if (data.type === 'error') {
-          log('STT WS error: ' + data.error);
-          if (wsResolve) { wsResolve(null); wsResolve = null; }
+          log('STT SSE error: ' + data.error);
+          if (!resolved) { resolved = true; reject(new Error(data.error)); }
+          if (sttResolve) { sttResolve(null); sttResolve = null; }
         }
       } catch {}
     };
 
-    ws.onerror = () => {
-      log('STT WS connection error');
-      reject(new Error('WebSocket error'));
+    es.onerror = () => {
+      if (!resolved) { resolved = true; reject(new Error('SSE connection failed')); }
+      else if (sttResolve) { sttResolve(sttTranscript || null); sttResolve = null; }
     };
 
-    ws.onclose = () => {
-      if (wsResolve) { wsResolve(wsTranscript || null); wsResolve = null; }
-    };
-
-    wsStt = ws;
+    sttEventSource = es;
   });
+}
+
+function sendAudioChunk(blob) {
+  if (!sttSessionId) return Promise.resolve();
+  return fetch('/stt-chunk', {
+    method: 'POST',
+    headers: { 'X-Session-Id': sttSessionId },
+    body: blob,
+  }).catch(e => log('Chunk send error: ' + e.message));
+}
+
+function sendStopSignal() {
+  if (!sttSessionId) return Promise.resolve();
+  return fetch('/stt-stop', {
+    method: 'POST',
+    headers: { 'X-Session-Id': sttSessionId },
+  }).catch(e => log('Stop signal error: ' + e.message));
 }
 
 // ── Batch STT fallback ──────────────────────────────────────────────────────
@@ -186,7 +205,7 @@ function startRecordingCycle() {
     mediaRecorder = new MediaRecorder(mediaStream, { mimeType });
   } catch (err) {
     log('MediaRecorder error: ' + err.message);
-    setState('error', 'Cannot record audio. Check mic permissions.');
+    setState('error', 'Cannot record audio.');
     return;
   }
 
@@ -194,10 +213,7 @@ function startRecordingCycle() {
   mediaRecorder.onstop = onRecordingStop;
   mediaRecorder.start(100);
 
-  let speechStarted = false;
-  let speechStartTime = 0;
-  let lastSpeechTime = 0;
-  let recordingStartTime = Date.now();
+  let speechStarted = false, speechStartTime = 0, lastSpeechTime = 0, recordingStartTime = Date.now();
 
   function vadLoop() {
     if (speaking) return;
@@ -206,37 +222,23 @@ function startRecordingCycle() {
     if (vol > VAD_THRESHOLD) {
       lastSpeechTime = now;
       if (!speechStarted) {
-        speechStarted = true;
-        speechStartTime = now;
+        speechStarted = true; speechStartTime = now;
         setState('hearing', 'Hearing you…');
-        interimEl.textContent = '…';
-        interimEl.classList.add('active');
+        interimEl.textContent = '…'; interimEl.classList.add('active');
         log('Speech detected (vol=' + vol.toFixed(3) + ')');
       }
-      vadRAF = requestAnimationFrame(vadLoop);
-      return;
+      vadRAF = requestAnimationFrame(vadLoop); return;
     }
     if (speechStarted) {
       if (now - lastSpeechTime > SILENCE_MS) {
-        const speechDuration = lastSpeechTime - speechStartTime;
-        if (speechDuration < MIN_SPEECH_MS) {
-          log('Speech too short (' + speechDuration + 'ms), ignoring');
-          speechStarted = false;
-          vadRAF = requestAnimationFrame(vadLoop);
-          return;
-        }
-        log('Silence after ' + speechDuration + 'ms of speech — stopping');
-        interimEl.textContent = '';
-        interimEl.classList.remove('active');
-        try { mediaRecorder.stop(); } catch {}
-        return;
+        const dur = lastSpeechTime - speechStartTime;
+        if (dur < MIN_SPEECH_MS) { log('Speech too short (' + dur + 'ms)'); speechStarted = false; vadRAF = requestAnimationFrame(vadLoop); return; }
+        log('Silence after ' + dur + 'ms — stopping');
+        interimEl.textContent = ''; interimEl.classList.remove('active');
+        try { mediaRecorder.stop(); } catch {} return;
       }
-    } else {
-      if (now - recordingStartTime > NO_SPEECH_TIMEOUT) {
-        log('No speech for 30s — restarting idle');
-        try { mediaRecorder.stop(); } catch {}
-        return;
-      }
+    } else if (now - recordingStartTime > NO_SPEECH_TIMEOUT) {
+      try { mediaRecorder.stop(); } catch {} return;
     }
     vadRAF = requestAnimationFrame(vadLoop);
   }
@@ -250,11 +252,7 @@ async function onRecordingStop() {
   cancelAnimationFrame(vadRAF);
   const blob = new Blob(audioChunks, { type: 'audio/webm' });
   audioChunks = [];
-  if (blob.size < MIN_BLOB_BYTES) {
-    log('Audio too small (' + blob.size + ' bytes) — skipping');
-    startRecordingCycle();
-    return;
-  }
+  if (blob.size < MIN_BLOB_BYTES) { log('Audio too small — skipping'); startRecordingCycle(); return; }
   setState('translating', 'Transcribing…');
   log('Sending ' + blob.size + ' bytes to Deepgram (batch)…');
   try {
@@ -271,16 +269,17 @@ async function onRecordingStop() {
   }
 }
 
-// ── Streaming STT recording cycle ───────────────────────────────────────────
+// ── Streaming STT recording cycle (SSE + fetch) ─────────────────────────────
 
 function startRecordingCycleStreaming() {
   if (speaking || paused) return;
   audioChunks = [];
-  wsTranscript = '';
+  sttTranscript = '';
   interimEl.textContent = '';
   interimEl.classList.remove('active');
 
-  connectSttWebSocket().then(ws => {
+  // Open SSE connection first, then start recording
+  openSttSSE().then(es => {
     const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
       ? 'audio/webm;codecs=opus' : 'audio/webm';
 
@@ -289,25 +288,23 @@ function startRecordingCycleStreaming() {
     } catch (err) {
       log('MediaRecorder error: ' + err.message);
       setState('error', 'Cannot record audio.');
-      ws.close();
+      closeSttSession();
       return;
     }
 
     mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-        e.data.arrayBuffer().then(buf => ws.send(buf));
-      }
+      if (e.data.size > 0) sendAudioChunk(e.data);
     };
 
     mediaRecorder.onstop = () => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'stop' }));
+      sendStopSignal();
+      // Wait for final transcript via SSE with timeout
       const p = new Promise(resolve => {
-        wsResolve = resolve;
-        setTimeout(() => { if (wsResolve === resolve) { wsResolve = null; resolve(wsTranscript || null); } }, 5000);
+        sttResolve = resolve;
+        setTimeout(() => { if (sttResolve === resolve) { sttResolve = null; resolve(sttTranscript || null); } }, 5000);
       });
       p.then(transcript => {
-        ws.close();
-        wsStt = null;
+        closeSttSession();
         if (transcript && transcript.trim()) {
           log('Transcript: "' + transcript + '"');
           handleUtterance(transcript);
@@ -320,10 +317,7 @@ function startRecordingCycleStreaming() {
 
     mediaRecorder.start(100);
 
-    let speechStarted = false;
-    let speechStartTime = 0;
-    let lastSpeechTime = 0;
-    let recordingStartTime = Date.now();
+    let speechStarted = false, speechStartTime = 0, lastSpeechTime = 0, recordingStartTime = Date.now();
 
     function vadLoop() {
       if (speaking) return;
@@ -332,37 +326,23 @@ function startRecordingCycleStreaming() {
       if (vol > VAD_THRESHOLD) {
         lastSpeechTime = now;
         if (!speechStarted) {
-          speechStarted = true;
-          speechStartTime = now;
+          speechStarted = true; speechStartTime = now;
           setState('hearing', 'Hearing you…');
-          interimEl.textContent = '…';
-          interimEl.classList.add('active');
+          interimEl.textContent = '…'; interimEl.classList.add('active');
           log('Speech detected (vol=' + vol.toFixed(3) + ')');
         }
-        vadRAF = requestAnimationFrame(vadLoop);
-        return;
+        vadRAF = requestAnimationFrame(vadLoop); return;
       }
       if (speechStarted) {
         if (now - lastSpeechTime > SILENCE_MS) {
           const dur = lastSpeechTime - speechStartTime;
-          if (dur < MIN_SPEECH_MS) {
-            log('Speech too short (' + dur + 'ms), ignoring');
-            speechStarted = false;
-            vadRAF = requestAnimationFrame(vadLoop);
-            return;
-          }
-          log('Silence after ' + dur + 'ms of speech — stopping');
-          interimEl.textContent = '';
-          interimEl.classList.remove('active');
-          try { mediaRecorder.stop(); } catch {}
-          return;
+          if (dur < MIN_SPEECH_MS) { log('Speech too short (' + dur + 'ms)'); speechStarted = false; vadRAF = requestAnimationFrame(vadLoop); return; }
+          log('Silence after ' + dur + 'ms — stopping');
+          interimEl.textContent = ''; interimEl.classList.remove('active');
+          try { mediaRecorder.stop(); } catch {} return;
         }
-      } else {
-        if (now - recordingStartTime > NO_SPEECH_TIMEOUT) {
-          log('No speech for 30s — restarting idle');
-          try { mediaRecorder.stop(); } catch {}
-          return;
-        }
+      } else if (now - recordingStartTime > NO_SPEECH_TIMEOUT) {
+        try { mediaRecorder.stop(); } catch {} return;
       }
       vadRAF = requestAnimationFrame(vadLoop);
     }
@@ -385,11 +365,7 @@ async function handleUtterance(text) {
   setState('translating', 'Translating…');
   const token = ++translateToken;
   try {
-    const resp = await fetch('/translate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    });
+    const resp = await fetch('/translate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) console.error('Translate error:', resp.status, data);
     if (token !== translateToken) return;
@@ -397,10 +373,7 @@ async function handleUtterance(text) {
     if (!translation) { startRecordingCycleStreaming(); return; }
     const outLang = /[一-鿿]/.test(translation) ? 'zh' : 'en';
     addTurn('trans', outLang, translation);
-    speakStreaming(translation, outLang, () => {
-      speaking = false;
-      startRecordingCycleStreaming();
-    });
+    speakStreaming(translation, outLang, () => { speaking = false; startRecordingCycleStreaming(); });
   } catch (err) {
     console.error('Translation error:', err);
     addTurn('trans', expectLang === 'en' ? 'zh' : 'en', '(translation error)');
@@ -440,11 +413,7 @@ async function speakStreaming(text, lang, onDone) {
     mediaSource.addEventListener('sourceopen', async () => {
       try {
         const sb = mediaSource.addSourceBuffer('audio/mpeg');
-        const resp = await fetch('/tts-stream', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text }),
-        });
+        const resp = await fetch('/tts-stream', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
         if (!resp.ok) throw new Error('TTS stream HTTP ' + resp.status);
 
         const reader = resp.body.getReader();

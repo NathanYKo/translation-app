@@ -162,11 +162,13 @@ export class WSConnection extends EventEmitter {
 export function handleUpgrade(req, socket, head) {
   return new Promise((resolve, reject) => {
     const key = req.headers['sec-websocket-key'];
+    console.log('[ws] handleUpgrade called, key:', key ? key.slice(0,10)+'...' : 'MISSING');
     if (!key) { socket.destroy(); return reject(new Error('Missing Sec-WebSocket-Key')); }
     const accept = crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
-    socket.write(
-      `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`
-    );
+    const resp = `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`;
+    console.log('[ws] writing upgrade response...');
+    socket.write(resp);
+    console.log('[ws] upgrade response written, creating connection');
     const conn = new WSConnection(socket, false);
     if (head?.length) conn._feed(head);
     resolve(conn);

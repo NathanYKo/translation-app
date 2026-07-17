@@ -1,11 +1,11 @@
 import http from 'node:http';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { handleUpgrade, connect as wsConnect, OPCODES } from './ws.js';
+import { connect as wsConnect, OPCODES } from './ws.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-// Optional local .env (keeps keys out of the shell / command line).
 try {
   const envText = fs.readFileSync(path.join(__dirname, '.env'), 'utf8');
   for (const line of envText.split('\n')) {
@@ -19,22 +19,18 @@ try {
 
 const PORT = Number(process.env.PORT) || 3000;
 
-// Translation (LLM) — OpenRouter.
 const OR_API_KEY = process.env.OPENROUTER_API_KEY;
 const OR_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-2.5-flash';
 const OR_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
-// Text-to-speech — ElevenLabs.
 const EL_API_KEY = process.env.ELEVENLABS_API_KEY;
 const EL_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
 const EL_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_multilingual_v2';
 const EL_URL = `https://api.elevenlabs.io/v1/text-to-speech/${EL_VOICE_ID}?output_format=mp3_44100_128`;
 const EL_STREAM_URL = `https://api.elevenlabs.io/v1/text-to-speech/${EL_VOICE_ID}/stream?output_format=mp3_44100_128`;
 
-// Speech-to-text — Deepgram.
 const DG_API_KEY = process.env.DEEPGRAM_API_KEY;
 
-// Shortened translation prompt (~40% fewer tokens).
 const SYSTEM_PROMPT = `Translate between English and Chinese (Mandarin). Detect input language: English→Chinese, Chinese→English. Reply with ONLY JSON: {"source":"en"|"zh","translation":"<text>"}. Keep it natural and concise. Empty/nonsense → {"source":"en","translation":""}.`;
 
 const MIME = {
@@ -84,8 +80,7 @@ async function translate(text) {
       'X-OpenRouter-Title': 'Realtime Translator',
     },
     body: JSON.stringify({
-      model: OR_MODEL,
-      temperature: 0.3,
+      model: OR_MODEL, temperature: 0.3,
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: text },
@@ -107,7 +102,7 @@ async function translate(text) {
   return { source: target === 'zh' ? 'en' : 'zh', translation };
 }
 
-// ── ElevenLabs TTS (batch) ──────────────────────────────────────────────────
+// ── ElevenLabs TTS ──────────────────────────────────────────────────────────
 
 async function textToSpeech(text) {
   const resp = await fetch(EL_URL, {
@@ -122,7 +117,7 @@ async function textToSpeech(text) {
   return Buffer.from(await resp.arrayBuffer());
 }
 
-// ── Deepgram STT (batch — fallback) ─────────────────────────────────────────
+// ── Deepgram STT (batch fallback) ───────────────────────────────────────────
 
 async function speechToText(audioBuffer, lang) {
   const langMap = { en: 'en', zh: 'zh-CN' };
@@ -140,66 +135,64 @@ async function speechToText(audioBuffer, lang) {
   return (data?.results?.channels?.[0]?.alternatives?.[0]?.transcript || '').trim();
 }
 
-// ── Deepgram streaming STT proxy (WebSocket) ────────────────────────────────
+// ── Streaming STT via SSE + fetch (browser-friendly, no WebSocket needed) ──
 
-async function handleStreamingSTT(wsConn, lang) {
-  let dgConn = null;
-  let finalTranscript = '';
+const sttSessions = new Map();  // sessionId → { dgConn, res }
 
-  try {
-    const langMap = { en: 'en', zh: 'zh-CN' };
-    const params = new URLSearchParams({ model: 'nova-2', language: langMap[lang] || 'en', smart_format: 'true', punctuate: 'true' });
-    dgConn = await wsConnect(`wss://api.deepgram.com/v1/listen?${params}`, { Authorization: `Token ${DG_API_KEY}` });
+async function startSttSession(res, lang) {
+  const sessionId = crypto.randomUUID();
+  const langMap = { en: 'en', zh: 'zh-CN' };
+  const params = new URLSearchParams({ model: 'nova-2', language: langMap[lang] || 'en', smart_format: 'true', punctuate: 'true' });
+  const dgUrl = `wss://api.deepgram.com/v1/listen?${params}`;
 
-    // Browser audio → Deepgram
-    wsConn.on('message', (data, isBinary) => {
-      if (dgConn._closed) return;
-      if (isBinary) {
-        dgConn.send(data, OPCODES.BINARY);
-      } else {
-        try {
-          const msg = JSON.parse(data);
-          if (msg.type === 'stop') dgConn.send(JSON.stringify({ type: 'CloseStream' }));
-        } catch {}
+  console.log(`[stt] session ${sessionId} opening Deepgram stream…`);
+  const dgConn = await wsConnect(dgUrl, { Authorization: `Token ${DG_API_KEY}` });
+  console.log(`[stt] session ${sessionId} Deepgram connected`);
+
+  sttSessions.set(sessionId, { dgConn, res });
+
+  // Send session ID to browser
+  res.write(`data: ${JSON.stringify({ type: 'session', sessionId })}\n\n`);
+
+  // Deepgram transcripts → SSE → Browser
+  dgConn.on('message', (data, isBinary) => {
+    if (isBinary || res.writableEnded) return;
+    try {
+      const result = JSON.parse(data);
+      const transcript = result?.channel?.alternatives?.[0]?.transcript || '';
+      const isFinal = result?.is_final || false;
+      const speechFinal = result?.speech_final || false;
+
+      if (transcript) {
+        res.write(`data: ${JSON.stringify({ type: 'transcript', text: transcript, isFinal })}\n\n`);
       }
-    });
-
-    // Deepgram transcripts → Browser
-    dgConn.on('message', (data, isBinary) => {
-      if (isBinary || wsConn._closed) return;
-      try {
-        const result = JSON.parse(data);
-        const transcript = result?.channel?.alternatives?.[0]?.transcript || '';
-        const isFinal = result?.is_final || false;
-        const speechFinal = result?.speech_final || false;
-
-        if (transcript) {
-          wsConn.send(JSON.stringify({ type: 'transcript', text: transcript, isFinal }));
-          if (isFinal) finalTranscript = transcript;
-        }
-        if (speechFinal && finalTranscript) {
-          wsConn.send(JSON.stringify({ type: 'final', text: finalTranscript }));
-          dgConn.close();
-          wsConn.close();
-        }
-      } catch {}
-    });
-
-    wsConn.on('close', () => { if (dgConn && !dgConn._closed) dgConn.close(); });
-    dgConn.on('close', () => {
-      if (!wsConn._closed) {
-        if (finalTranscript) wsConn.send(JSON.stringify({ type: 'final', text: finalTranscript }));
-        wsConn.close();
+      if (speechFinal) {
+        res.write(`data: ${JSON.stringify({ type: 'final', text: transcript })}\n\n`);
+        cleanup();
       }
-    });
-    dgConn.on('error', (err) => {
-      console.error('Deepgram WS error:', err.message);
-      if (!wsConn._closed) { wsConn.send(JSON.stringify({ type: 'error', error: err.message })); wsConn.close(); }
-    });
-  } catch (err) {
-    console.error('Deepgram connect error:', err.message);
-    if (!wsConn._closed) { wsConn.send(JSON.stringify({ type: 'error', error: 'STT service unavailable' })); wsConn.close(); }
+    } catch {}
+  });
+
+  dgConn.on('close', () => cleanup());
+  dgConn.on('error', (err) => {
+    console.error(`[stt] session ${sessionId} Deepgram error:`, err.message);
+    if (!res.writableEnded) res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`);
+    cleanup();
+  });
+
+  // Clean up when browser disconnects (closes SSE)
+  req.on('close', () => {
+    console.log(`[stt] session ${sessionId} browser disconnected`);
+    cleanup();
+  });
+
+  function cleanup() {
+    if (dgConn && !dgConn._closed) dgConn.close();
+    sttSessions.delete(sessionId);
+    if (!res.writableEnded) res.end();
   }
+
+  return sessionId;
 }
 
 // ── HTTP server ─────────────────────────────────────────────────────────────
@@ -209,31 +202,87 @@ const server = http.createServer(async (req, res) => {
 
   // POST /translate
   if (req.method === 'POST' && urlPath === '/translate') {
-    if (!OR_API_KEY) { sendJSON(res, 500, { error: 'OPENROUTER_API_KEY is not set on the server' }); return; }
+    if (!OR_API_KEY) { sendJSON(res, 500, { error: 'OPENROUTER_API_KEY not set' }); return; }
     try {
       const raw = await readBody(req);
       const { text } = JSON.parse(raw.toString() || '{}');
       if (!text || !text.trim()) { sendJSON(res, 200, { source: 'en', translation: '' }); return; }
       sendJSON(res, 200, await translate(text));
-    } catch (e) { sendJSON(res, 502, { error: e.message || 'translation failed' }); }
+    } catch (e) { sendJSON(res, 502, { error: e.message }); }
     return;
   }
 
   // POST /stt  (batch fallback)
   if (req.method === 'POST' && urlPath === '/stt') {
-    if (!DG_API_KEY) { sendJSON(res, 500, { error: 'DEEPGRAM_API_KEY is not set on the server' }); return; }
+    if (!DG_API_KEY) { sendJSON(res, 500, { error: 'DEEPGRAM_API_KEY not set' }); return; }
     try {
       const audioBuffer = await readBody(req);
       const lang = new URL(req.url, 'http://localhost').searchParams.get('lang') || 'en';
       if (!audioBuffer.length) { sendJSON(res, 200, { transcript: '' }); return; }
       sendJSON(res, 200, { transcript: await speechToText(audioBuffer, lang) });
-    } catch (e) { sendJSON(res, 502, { error: e.message || 'stt failed' }); }
+    } catch (e) { sendJSON(res, 502, { error: e.message }); }
+    return;
+  }
+
+  // GET /stt-sse?lang=en  (streaming STT — SSE endpoint)
+  if (req.method === 'GET' && urlPath === '/stt-sse') {
+    if (!DG_API_KEY) { sendJSON(res, 500, { error: 'DEEPGRAM_API_KEY not set' }); return; }
+    const lang = new URL(req.url, 'http://localhost').searchParams.get('lang') || 'en';
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+    try {
+      await startSttSession(res, lang);
+    } catch (err) {
+      console.error('[stt] session open failed:', err.message);
+      try {
+        res.write(`data: ${JSON.stringify({ type: 'error', error: 'STT unavailable: ' + err.message })}\n\n`);
+        res.end();
+      } catch {}
+    }
+    return;
+  }
+
+  // POST /stt-chunk  (audio chunk → Deepgram, identified by X-Session-Id)
+  if (req.method === 'POST' && urlPath === '/stt-chunk') {
+    try {
+      const sessionId = req.headers['x-session-id'];
+      const session = sttSessions.get(sessionId);
+      if (!session) { sendJSON(res, 404, { error: 'Session not found' }); return; }
+      const chunk = await readBody(req);
+      if (chunk.length > 0 && !session.dgConn._closed) {
+        session.dgConn.send(chunk, OPCODES.BINARY);
+      }
+      sendJSON(res, 200, { ok: true });
+    } catch (e) {
+      console.error('[stt] chunk error:', e.message);
+      sendJSON(res, 500, { error: e.message });
+    }
+    return;
+  }
+
+  // POST /stt-stop  (signal end of speech)
+  if (req.method === 'POST' && urlPath === '/stt-stop') {
+    try {
+      const sessionId = req.headers['x-session-id'];
+      const session = sttSessions.get(sessionId);
+      if (!session) { sendJSON(res, 404, { error: 'Session not found' }); return; }
+      if (!session.dgConn._closed) {
+        session.dgConn.send(JSON.stringify({ type: 'CloseStream' }));
+      }
+      sendJSON(res, 200, { ok: true });
+    } catch (e) {
+      console.error('[stt] stop error:', e.message);
+      sendJSON(res, 500, { error: e.message });
+    }
     return;
   }
 
   // POST /tts  (batch)
   if (req.method === 'POST' && urlPath === '/tts') {
-    if (!EL_API_KEY) { sendJSON(res, 500, { error: 'ELEVENLABS_API_KEY is not set on the server' }); return; }
+    if (!EL_API_KEY) { sendJSON(res, 500, { error: 'ELEVENLABS_API_KEY not set' }); return; }
     try {
       const raw = await readBody(req);
       const { text } = JSON.parse(raw.toString() || '{}');
@@ -241,18 +290,17 @@ const server = http.createServer(async (req, res) => {
       const audio = await textToSpeech(text);
       res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': audio.length, 'Cache-Control': 'no-store' });
       res.end(audio);
-    } catch (e) { sendJSON(res, 502, { error: e.message || 'tts failed' }); }
+    } catch (e) { sendJSON(res, 502, { error: e.message }); }
     return;
   }
 
-  // POST /tts-stream  (streaming — proxies chunked response from ElevenLabs)
+  // POST /tts-stream  (streaming TTS)
   if (req.method === 'POST' && urlPath === '/tts-stream') {
-    if (!EL_API_KEY) { sendJSON(res, 500, { error: 'ELEVENLABS_API_KEY is not set on the server' }); return; }
+    if (!EL_API_KEY) { sendJSON(res, 500, { error: 'ELEVENLABS_API_KEY not set' }); return; }
     try {
       const raw = await readBody(req);
       const { text } = JSON.parse(raw.toString() || '{}');
       if (!text || !text.trim()) { res.writeHead(204); res.end(); return; }
-
       const resp = await fetch(EL_STREAM_URL, {
         method: 'POST',
         headers: { 'xi-api-key': EL_API_KEY, 'Content-Type': 'application/json' },
@@ -262,7 +310,6 @@ const server = http.createServer(async (req, res) => {
         const errText = await resp.text().catch(() => '');
         throw new Error(`ElevenLabs ${resp.status}: ${errText.slice(0, 200)}`);
       }
-
       res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Transfer-Encoding': 'chunked', 'Cache-Control': 'no-store' });
       const reader = resp.body.getReader();
       for (;;) {
@@ -271,7 +318,7 @@ const server = http.createServer(async (req, res) => {
         res.write(value);
       }
       res.end();
-    } catch (e) { sendJSON(res, 502, { error: e.message || 'tts-stream failed' }); }
+    } catch (e) { sendJSON(res, 502, { error: e.message }); }
     return;
   }
 
@@ -287,31 +334,19 @@ const server = http.createServer(async (req, res) => {
   });
 });
 
-// ── WebSocket upgrade (/ws) for streaming STT ───────────────────────────────
-
-server.on('upgrade', (req, socket, head) => {
-  const u = new URL(req.url, 'http://localhost');
-  if (u.pathname === '/ws') {
-    handleUpgrade(req, socket, head)
-      .then((conn) => handleStreamingSTT(conn, u.searchParams.get('lang') || 'en'))
-      .catch((err) => { console.error('WS upgrade error:', err.message); socket.destroy(); });
-  } else {
-    socket.destroy();
-  }
-});
-
 // ── Start ───────────────────────────────────────────────────────────────────
 
-server.listen(PORT, () => {
-  console.log(`Realtime translator (Deepgram + OpenRouter + ElevenLabs) listening on http://localhost:${PORT}`);
-  if (!DG_API_KEY) console.warn('WARNING: DEEPGRAM_API_KEY is not set. Speech recognition will fail.');
-  else console.log('  Deepgram STT: nova-2 (streaming + batch fallback)');
-  if (!OR_API_KEY) console.warn('WARNING: OPENROUTER_API_KEY is not set. Translation will fail.');
-  else console.log(`  OPENROUTER_MODEL: ${OR_MODEL}`);
-  if (!EL_API_KEY) console.warn('WARNING: ELEVENLABS_API_KEY is not set. Speech output will fail.');
-  else console.log(`  ELEVENLABS_VOICE_ID: ${EL_VOICE_ID}  MODEL: ${EL_MODEL}`);
+process.on('uncaughtException', (e) => { console.error('[FATAL]', e.message, e.stack); });
+process.on('unhandledRejection', (e) => { console.error('[UNHANDLED]', e); });
 
-  // Warm up TCP/TLS connections to all three APIs (non-blocking).
+server.listen(PORT, () => {
+  console.log(`Realtime translator listening on http://localhost:${PORT}`);
+  if (!DG_API_KEY) console.warn('WARNING: DEEPGRAM_API_KEY not set.');
+  else console.log('  Deepgram STT: nova-2 (SSE streaming + batch fallback)');
+  if (!OR_API_KEY) console.warn('WARNING: OPENROUTER_API_KEY not set.');
+  else console.log(`  Model: ${OR_MODEL}`);
+  if (!EL_API_KEY) console.warn('WARNING: ELEVENLABS_API_KEY not set.');
+  else console.log(`  ElevenLabs: ${EL_VOICE_ID} / ${EL_MODEL}`);
   warmUpConnections();
 });
 
