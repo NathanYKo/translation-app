@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Realtime Translator</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        background: #0e1116;
+        color: #e6e6e6;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        height: 100dvh;
+      }
+      header {
+        padding: 14px 20px;
+        font-size: 13px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: #7aa2f7;
+        border-bottom: 1px solid #1e2430;
+      }
+      main {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 18px;
+        gap: 14px;
+        min-height: 0;
+      }
+      /* Language indicator — tells you which language to speak this turn. */
+      #lang {
+        font-size: 15px;
+        font-weight: 600;
+        padding: 8px 18px;
+        border-radius: 999px;
+        border: 1px solid #1e2430;
+        cursor: pointer;
+        user-select: none;
+        transition: transform 0.1s ease;
+      }
+      #lang:active { transform: scale(0.95); }
+
+
+      #lang.en { color: #3ddc84; box-shadow: 0 0 18px -6px #3ddc8488; }
+      #lang.zh { color: #ffb454; box-shadow: 0 0 18px -6px #ffb45488; }
+
+      .pulse {
+        width: 84px; height: 84px; border-radius: 50%;
+        background: radial-gradient(circle at 50% 45%, #1b3a5c, #0e1116 70%);
+        box-shadow: 0 0 0 1px #1e2430;
+        display: grid; place-items: center;
+        cursor: pointer; user-select: none;
+        --vol: 0;
+        transform: scale(calc(1 + var(--vol) * 0.35));
+        transition: box-shadow 0.1s ease, background 0.2s ease, opacity 0.2s ease;
+      }
+      .pulse .ring {
+        width: 36px; height: 36px; border-radius: 50%; background: #3b4252;
+        transform: scale(calc(1 + var(--vol) * 0.3));
+        transition: background 0.15s ease;
+      }
+      /* Listening: green, glow reacts to volume */
+      body[data-state="listening"] .pulse {
+        box-shadow: 0 0 0 1px #1e2430,
+          0 0 calc(8px + var(--vol) * 40px) calc(-2px + var(--vol) * 6px) #3ddc8488;
+      }
+      body[data-state="listening"] .pulse .ring { background: #3ddc84; }
+      /* Hearing: blue, strong reactive glow */
+      body[data-state="hearing"] .pulse {
+        box-shadow: 0 0 0 1px #1e2430,
+          0 0 calc(10px + var(--vol) * 50px) calc(0px + var(--vol) * 8px) #7aa2f7aa;
+      }
+      body[data-state="hearing"] .pulse .ring { background: #7aa2f7; }
+      /* Translating / Speaking: orange */
+      body[data-state="translating"] .pulse,
+      body[data-state="speaking"] .pulse {
+        box-shadow: 0 0 0 1px #1e2430, 0 0 30px -2px #ffb45488;
+      }
+      body[data-state="translating"] .pulse .ring,
+      body[data-state="speaking"] .pulse .ring { background: #ffb454; }
+      /* Error: red */
+      body[data-state="error"] .pulse .ring { background: #f7768e; }
+      /* Paused: dim */
+      body[data-state="paused"] .pulse { box-shadow: 0 0 0 1px #1e2430; opacity: 0.45; }
+      body[data-state="paused"] .pulse .ring { background: #6b7280; }
+      body[data-state="hearing"] .pulse { box-shadow: 0 0 0 1px #1e2430, 0 0 34px 0px #7aa2f7aa; transform: scale(1.1); }
+      body[data-state="hearing"] .pulse .ring { background: #7aa2f7; transform: scale(1.2); animation: hearPulse 0.6s ease-in-out infinite alternate; }
+      @keyframes hearPulse { from { transform: scale(1.15); } to { transform: scale(1.28); } }
+
+      #status { font-size: 15px; color: #cdd6f4; min-height: 1.4em; }
+
+      /* Live interim speech bubble — shows what the mic is picking up in real time. */
+      #interim {
+        width: 100%; max-width: 640px;
+        padding: 10px 14px; border-radius: 12px;
+        border: 1px dashed #3b4252; background: #151920;
+        color: #7aa2f7; font-size: 15px; line-height: 1.45;
+        min-height: 0; max-height: 120px; overflow-y: auto;
+        display: none; /* hidden until we hear something */
+        font-style: italic; opacity: 0.85;
+      }
+      #interim.active { display: block; }
+
+      /* Turn-by-turn transcript. */
+      #transcript {
+        width: 100%; max-width: 640px; flex: 1; min-height: 0;
+        overflow-y: auto; display: flex; flex-direction: column; gap: 10px;
+        padding: 4px 2px;
+      }
+      .turn { display: flex; flex-direction: column; gap: 3px; max-width: 85%; }
+      .turn.you { align-self: flex-start; align-items: flex-start; }
+      .turn.trans { align-self: flex-end; align-items: flex-end; }
+      .turn .who { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: #6b7280; }
+      .turn .body { padding: 10px 14px; border-radius: 12px; line-height: 1.45; font-size: 16px; }
+      .turn.you .body { background: #1b2433; border: 1px solid #243049; color: #cdd6f4; border-bottom-left-radius: 4px; }
+      .turn.trans .body { background: #2a2415; border: 1px solid #3a3119; color: #f9e2af; border-bottom-right-radius: 4px; }
+      #hint { font-size: 12px; color: #6b7280; text-align: center; line-height: 1.5; }
+
+      /* Debug log panel. */
+      #log {
+        width: 100%; max-width: 640px;
+        max-height: 140px; overflow-y: auto;
+        background: #0a0c10; border: 1px solid #1e2430; border-radius: 8px;
+        padding: 8px 10px; font-family: monospace; font-size: 11px;
+        color: #6b7280; line-height: 1.6;
+      }
+
+      #start {
+        position: fixed; inset: 0; z-index: 10;
+        display: grid; place-items: center;
+        background: rgba(8, 10, 14, 0.92);
+        cursor: pointer; text-align: center; padding: 24px;
+      }
+      #start .big { font-size: 26px; font-weight: 600; margin-bottom: 10px; }
+      #start .sub { font-size: 14px; color: #9aa5b1; line-height: 1.5; max-width: 420px; }
+    </style>
+  </head>
+  <body data-state="boot">
+    <header>Realtime Translator &middot; English &harr; Chinese</header>
+    <main>
+      <div id="lang" class="en">Now speak: English · tap to switch</div>
+      <div class="pulse"><div class="ring"></div></div>
+      <div id="status">Loading&hellip;</div>
+      <div id="interim"></div>
+      <div id="transcript"></div>
+      <div id="hint">The indicator shows which language to speak. Click the language pill to switch. Click the circle to pause/resume.</div>
+      <div id="log"></div>
+    </main>
+    <div id="start">
+      <div class="card">
+        <div class="big">Tap to start</div>
+        <div class="sub">Browsers require one tap to enable the microphone and audio. After that, just talk.</div>
+      </div>
+    </div>
+    <script src="app.js"></script>
+  </body>
+</html>

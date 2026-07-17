@@ -1,0 +1,9 @@
+{
+  "name": "realtime-translator",
+  "version": "1.0.0",
+  "description": "No-button realtime English<->Chinese voice translator: browser STT -> OpenRouter LLM -> browser TTS.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
