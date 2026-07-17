@@ -52,6 +52,7 @@
       #lang.zh { color: #ffb454; box-shadow: 0 0 18px -6px #ffb45488; }
 
       .pulse {
+        position: relative;
         width: 84px; height: 84px; border-radius: 50%;
         background: radial-gradient(circle at 50% 45%, #1b3a5c, #0e1116 70%);
         box-shadow: 0 0 0 1px #1e2430;
@@ -59,42 +60,76 @@
         cursor: pointer; user-select: none;
         --vol: 0;
         transform: scale(calc(1 + var(--vol) * 0.35));
-        transition: box-shadow 0.1s ease, background 0.2s ease, opacity 0.2s ease;
+        transition: box-shadow 0.06s linear, background 0.1s ease, opacity 0.1s ease, transform 0.06s linear;
       }
       .pulse .ring {
         width: 36px; height: 36px; border-radius: 50%; background: #3b4252;
-        transform: scale(calc(1 + var(--vol) * 0.3));
-        transition: background 0.15s ease;
+        transform: scale(calc(1 + var(--vol) * 0.45));
+        transition: background 0.08s ease, box-shadow 0.06s linear, transform 0.06s linear;
+      }
+      /* Outer halo ring — reacts to volume */
+      .pulse::before {
+        content: '';
+        position: absolute;
+        width: calc(84px + var(--vol) * 40px);
+        height: calc(84px + var(--vol) * 40px);
+        border-radius: 50%;
+        border: calc(1px + var(--vol) * 3px) solid transparent;
+        opacity: var(--vol);
+        transition: opacity 0.1s ease, border-color 0.15s ease;
+        pointer-events: none;
       }
       /* Listening: green, glow reacts to volume */
       body[data-state="listening"] .pulse {
         box-shadow: 0 0 0 1px #1e2430,
-          0 0 calc(8px + var(--vol) * 40px) calc(-2px + var(--vol) * 6px) #3ddc8488;
+          0 0 calc(4px + var(--vol) * 50px) calc(-2px + var(--vol) * 8px) #3ddc8466;
       }
       body[data-state="listening"] .pulse .ring { background: #3ddc84; }
-      /* Hearing: blue, strong reactive glow */
+      body[data-state="listening"] .pulse::before { border-color: #3ddc8444; }
+      /* Hearing: blue, strong reactive glow — volume drives everything */
       body[data-state="hearing"] .pulse {
         box-shadow: 0 0 0 1px #1e2430,
-          0 0 calc(10px + var(--vol) * 50px) calc(0px + var(--vol) * 8px) #7aa2f7aa;
+          0 0 calc(8px + var(--vol) * 60px) calc(0px + var(--vol) * 10px) #7aa2f7bb;
+        transform: scale(calc(1.05 + var(--vol) * 0.25));
       }
-      body[data-state="hearing"] .pulse .ring { background: #7aa2f7; }
+      body[data-state="hearing"] .pulse .ring {
+        background: #7aa2f7;
+        box-shadow: 0 0 calc(2px + var(--vol) * 20px) #7aa2f7aa;
+        transform: scale(calc(1.1 + var(--vol) * 0.5));
+      }
+      body[data-state="hearing"] .pulse::before {
+        border-color: #7aa2f788;
+        opacity: calc(var(--vol) * 1.5);
+      }
       /* Translating / Speaking: orange */
       body[data-state="translating"] .pulse,
       body[data-state="speaking"] .pulse {
-        box-shadow: 0 0 0 1px #1e2430, 0 0 30px -2px #ffb45488;
+        box-shadow: 0 0 0 1px #1e2430,
+          0 0 calc(12px + var(--vol) * 30px) 0px #ffb45488;
       }
       body[data-state="translating"] .pulse .ring,
       body[data-state="speaking"] .pulse .ring { background: #ffb454; }
+      body[data-state="translating"] .pulse::before,
+      body[data-state="speaking"] .pulse::before { border-color: #ffb45466; opacity: 0.6; }
       /* Error: red */
       body[data-state="error"] .pulse .ring { background: #f7768e; }
       /* Paused: dim */
       body[data-state="paused"] .pulse { box-shadow: 0 0 0 1px #1e2430; opacity: 0.45; }
       body[data-state="paused"] .pulse .ring { background: #6b7280; }
-      body[data-state="hearing"] .pulse { box-shadow: 0 0 0 1px #1e2430, 0 0 34px 0px #7aa2f7aa; transform: scale(1.1); }
-      body[data-state="hearing"] .pulse .ring { background: #7aa2f7; transform: scale(1.2); animation: hearPulse 0.6s ease-in-out infinite alternate; }
-      @keyframes hearPulse { from { transform: scale(1.15); } to { transform: scale(1.28); } }
 
       #status { font-size: 15px; color: #cdd6f4; min-height: 1.4em; }
+
+      /* Volume meter bar — visual debug of mic input level */
+      #volmeter {
+        width: 120px; height: 6px; border-radius: 3px;
+        background: #1e2430; overflow: hidden;
+        margin-top: 4px;
+      }
+      #volmeter .fill {
+        height: 100%; width: 0%; border-radius: 3px;
+        background: linear-gradient(90deg, #3ddc84, #7aa2f7 60%, #f7768e);
+        transition: width 0.06s linear;
+      }
 
       /* Live interim speech bubble — shows what the mic is picking up in real time. */
       #interim {
@@ -148,6 +183,7 @@
       <div id="lang" class="en">Now speak: English · tap to switch</div>
       <div class="pulse"><div class="ring"></div></div>
       <div id="status">Loading&hellip;</div>
+      <div id="volmeter"><div class="fill"></div></div>
       <div id="interim"></div>
       <div id="transcript"></div>
       <div id="hint">The indicator shows which language to speak. Click the language pill to switch. Click the circle to pause/resume.</div>

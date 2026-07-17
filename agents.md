@@ -52,6 +52,8 @@ node server.js              # or: npm start
 - Requires **Chrome or Edge** (the Web Speech API `SpeechRecognition` is not in Firefox).
 - A single tap is required by browsers to unlock mic + audio (autoplay/gesture rule).
 - Works on `localhost` (secure context). For LAN/HTTPS you need a trusted cert.
+- **Always restart the server** after any code change to `server.js` or `public/` files.
+  The server does not auto-reload.
 
 ## Environment variables
 | Var | Required | Default | Notes |

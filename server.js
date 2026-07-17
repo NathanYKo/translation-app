@@ -139,10 +139,19 @@ async function speechToText(audioBuffer, lang) {
 
 const sttSessions = new Map();  // sessionId → { dgConn, res }
 
-async function startSttSession(res, lang) {
+async function startSttSession(req, res, lang) {
   const sessionId = crypto.randomUUID();
   const langMap = { en: 'en', zh: 'zh-CN' };
-  const params = new URLSearchParams({ model: 'nova-2', language: langMap[lang] || 'en', smart_format: 'true', punctuate: 'true' });
+  const params = new URLSearchParams({ 
+    model: 'nova-2', 
+    language: langMap[lang] || 'en', 
+    smart_format: 'true', 
+    punctuate: 'true',
+    // Deepgram endpointing — server-side silence detection
+    endpointing: 'true',
+    utterance_end_ms: '1500',
+    interim_results: 'true',
+  });
   const dgUrl = `wss://api.deepgram.com/v1/listen?${params}`;
 
   console.log(`[stt] session ${sessionId} opening Deepgram stream…`);
@@ -234,7 +243,7 @@ const server = http.createServer(async (req, res) => {
       'Connection': 'keep-alive',
     });
     try {
-      await startSttSession(res, lang);
+      await startSttSession(req, res, lang);
     } catch (err) {
       console.error('[stt] session open failed:', err.message);
       try {
