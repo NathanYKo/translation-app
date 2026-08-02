@@ -284,6 +284,48 @@ const server = http.createServer(async (req, res) => {
     sendJSON(res, 200, metrics.snapshot());
     return;
   }
+
+  // POST /api/metrics/event (browser timing events)
+  if (req.method === 'POST' && urlPath === '/api/metrics/event') {
+    try {
+      const raw = await readBody(req);
+      const event = JSON.parse(raw.toString() || '{}');
+      if (event.marks && event.sessionId) {
+        const ms = event.marks;
+        const turn = {
+          sessionId: event.sessionId,
+          sourceLang: event.sourceLang || 'en',
+          targetLang: event.targetLang || 'zh',
+          turnNumber: 0,
+          transcriptLen: event.transcriptLen || 0,
+          translationLen: event.translationLen || 0,
+          sttLatencyMs: ms.stt_received && ms.turn_start ? Math.round(ms.stt_received - ms.turn_start) : 0,
+          translateLatencyMs: ms.translate_received && ms.translate_sent ? Math.round(ms.translate_received - ms.translate_sent) : 0,
+          ttsLatencyMs: ms.tts_played && ms.tts_sent ? Math.round(ms.tts_played - ms.tts_sent) : 0,
+          e2eLatencyMs: ms.turn_complete && ms.turn_start ? Math.round(ms.turn_complete - ms.turn_start) : 0,
+          ttsMode: event.ttsMode || 'unknown',
+          audioBytes: event.blobSize || 0,
+          speechDurationMs: event.speechDurationMs || 0,
+          fallback: event.fallback || false,
+          sttOk: event.error !== 'stt_error' ? 1 : 0,
+          translateOk: event.error !== 'translate_error' ? 1 : 0,
+          ttsOk: event.error !== 'tts_error' ? 1 : 0,
+          sttError: event.error === 'stt_error' ? 'browser_stt_failed' : null,
+          translateError: event.error === 'translate_error' ? 'browser_translate_failed' : null,
+          ttsError: event.error === 'tts_error' ? 'browser_tts_failed' : null,
+          timestamp: Date.now(),
+        };
+        metrics.recordTurn(turn);
+      }
+      res.writeHead(204);
+      res.end();
+    } catch {
+      res.writeHead(204);
+      res.end();
+    }
+    return;
+  }
+
   if (req.method === 'POST' && urlPath === '/stt') {
     if (!DG_API_KEY) { sendJSON(res, 500, { error: 'DEEPGRAM_API_KEY not set' }); return; }
     try {

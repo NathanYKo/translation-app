@@ -1,5 +1,5 @@
 // Realtime English<->Chinese voice translator
-// Simplified reliable version
+// Metrics-instrumented version
 
 const overlay = document.getElementById('start');
 const langEl = document.getElementById('lang');
@@ -25,6 +25,43 @@ function setState(s, text) {
   if (text != null) statusEl.textContent = text;
 }
 
+// ── Metrics instrumentation ──────────────────────────────────────────────
+
+/** Per-turn timing marks (performance.now()) */
+let turnMarks = {};
+
+/** Per-turn metadata (blobSize, lengths, ttsMode, error) */
+let turnMeta = {};
+
+/** Send accumulated metrics for a completed turn to the server */
+function sendMetrics() {
+  const marks = { ...turnMarks };
+  const meta = { ...turnMeta };
+  turnMarks = {};
+  turnMeta = {};
+
+  if (!marks.turn_start) return; // no speech was captured
+
+  const payload = {
+    sessionId: window.__sessionId,
+    marks,
+    sourceLang: expectLang,
+    targetLang: expectLang === 'en' ? 'zh' : 'en',
+    transcriptLen: meta.transcriptLen || 0,
+    translationLen: meta.translationLen || 0,
+    ttsMode: meta.ttsMode || 'unknown',
+    blobSize: meta.blobSize || 0,
+    speechDurationMs: meta.speechDurationMs || 0,
+    error: meta.error || null,
+    fallback: meta.fallback || false,
+  };
+
+  try {
+    const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+    navigator.sendBeacon('/api/metrics/event', blob);
+  } catch {}
+}
+
 const params = new URLSearchParams(location.search);
 let expectLang = params.get('lang') === 'zh' ? 'zh' : 'en';
 let speaking = false;
@@ -32,6 +69,11 @@ let started = false;
 let translateToken = 0;
 let currentAudio = null;
 let paused = false;
+
+// Session ID for metrics correlation (generated once per page load)
+window.__sessionId = crypto.randomUUID
+  ? crypto.randomUUID()
+  : Date.now().toString(36) + Math.random().toString(36).slice(2);
 
 // Audio state
 let mediaStream = null;
@@ -49,7 +91,9 @@ let sttReady = false;
 
 function updateLangUI() {
   const isEn = expectLang === 'en';
-  langEl.textContent = isEn ? 'Now speak: English · tap to switch' : 'Now speak: Chinese · tap to switch';
+  langEl.textContent = isEn
+    ? 'Now speak: English · tap to switch'
+    : 'Now speak: Chinese · tap to switch';
   langEl.className = isEn ? 'en' : 'zh';
 }
 
@@ -57,15 +101,12 @@ function toggleLang() {
   expectLang = expectLang === 'en' ? 'zh' : 'en';
   updateLangUI();
   log('Language switched to: ' + expectLang);
-  
-  // Reset and restart with new language
+
   if (started && !speaking) {
     listening = false;
     stopRecording();
     closeSttSession();
-    if (!paused) {
-      setTimeout(startListening, 300);
-    }
+    if (!paused) setTimeout(startListening, 300);
   }
 }
 
@@ -92,7 +133,6 @@ function togglePause() {
 
 pulseEl.addEventListener('click', togglePause);
 
-// Volume animation
 let volumeRAF = null;
 let volSmoothed = 0;
 function volumeLoop() {
@@ -119,7 +159,9 @@ function addTurn(side, lang, text) {
   const who = document.createElement('div');
   who.className = 'who';
   const label = lang === 'en' ? 'English' : 'Chinese';
-  who.textContent = side === 'you' ? `You (${label})` : `Translation (${label})`;
+  who.textContent = side === 'you'
+    ? `You (${label})`
+    : `Translation (${label})`;
   const body = document.createElement('div');
   body.className = 'body';
   body.textContent = text;
@@ -129,7 +171,6 @@ function addTurn(side, lang, text) {
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
-// Volume meter
 function getVolume() {
   if (!analyser) return 0;
   const buf = new Uint8Array(analyser.fftSize);
@@ -162,7 +203,7 @@ function stopRecording() {
   audioChunks = [];
 }
 
-// ── Batch STT (simple and reliable) ─────────────────────────────────────────
+// ── Batch STT ───────────────────────────────────────────────────────────────
 
 async function transcribeAudio(blob) {
   const resp = await fetch('/stt?lang=' + expectLang, {
@@ -180,13 +221,14 @@ async function transcribeAudio(blob) {
 function startListening() {
   if (speaking || paused || listening) return;
   listening = true;
-  
+
   audioChunks = [];
   interimEl.textContent = '';
   interimEl.classList.remove('active');
 
   const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-    ? 'audio/webm;codecs=opus' : 'audio/webm';
+    ? 'audio/webm;codecs=opus'
+    : 'audio/webm';
 
   try {
     mediaRecorder = new MediaRecorder(mediaStream, { mimeType });
@@ -198,25 +240,19 @@ function startListening() {
 
   mediaRecorder.ondataavailable = (e) => {
     if (e.data.size > 0) audioChunks.push(e.data);
-    
-    // Check total size - stop if too large (prevents 502 errors)
     const totalSize = audioChunks.reduce((sum, chunk) => sum + chunk.size, 0);
-    if (totalSize > 100000 && mediaRecorder.state === 'recording') { //100KB limit
+    if (totalSize > 100000 && mediaRecorder.state === 'recording') {
       log('Audio too large — stopping early');
       try { mediaRecorder.stop(); } catch {}
     }
   };
 
   mediaRecorder.onstop = async () => {
-    if (paused || speaking) {
-      listening = false;
-      return;
-    }
-    
+    if (paused || speaking) { listening = false; return; }
+
     const blob = new Blob(audioChunks, { type: 'audio/webm' });
     audioChunks = [];
-    
-    // Skip tiny blobs (noise)
+
     if (blob.size < 3000) {
       log('Audio too small — skipping');
       listening = false;
@@ -226,21 +262,31 @@ function startListening() {
 
     setState('translating', 'Transcribing…');
     log('Transcribing ' + blob.size + ' bytes…');
-    
+
     try {
       const transcript = await transcribeAudio(blob);
       listening = false;
+      // ── Metrics: STT received ──
+      turnMarks.stt_received = performance.now();
+      turnMeta.blobSize = blob.size;
+      turnMeta.transcriptLen = transcript.length;
+      // ─────────────────────────────
+
       if (transcript) {
         log('Transcript: "' + transcript + '"');
         handleUtterance(transcript);
       } else {
         log('Empty transcript — restarting');
+        turnMeta.error = 'stt_error';
+        turnMarks = {};
+        turnMeta = {};
         startListening();
       }
     } catch (err) {
       log('STT error: ' + err.message);
+      turnMeta.error = 'stt_error';
+      sendMetrics();
       listening = false;
-      // Don't immediately retry on error - wait a bit
       setTimeout(startListening, 1000);
     }
   };
@@ -249,7 +295,6 @@ function startListening() {
   setState('listening', 'Listening — speak now');
   log('Listening…');
 
-  // Simple VAD: detect speech start, then silence to stop
   let speechStarted = false;
   let lastSpeechTime = 0;
   const SILENCE_MS = 1500;
@@ -259,17 +304,20 @@ function startListening() {
 
   function vadLoop() {
     if (paused || speaking || !mediaRecorder || mediaRecorder.state !== 'recording') return;
-    
+
     const vol = getVolume();
     const now = Date.now();
 
     if (vol > 0.03) {
       volAboveThreshold++;
       lastSpeechTime = now;
-      
       if (!speechStarted && volAboveThreshold >= 3) {
         speechStarted = true;
         speechStartTime = now;
+        // ── Metrics: turn started ──
+        turnMarks = { turn_start: performance.now() };
+        turnMeta = {};
+        // ────────────────────────────
         setState('hearing', 'Hearing you…');
         interimEl.classList.add('active');
         log('Speech detected');
@@ -289,16 +337,15 @@ function startListening() {
           return;
         }
         log('Silence after ' + dur + 'ms — processing');
+        turnMeta.speechDurationMs = dur;
         interimEl.textContent = '';
         interimEl.classList.remove('active');
         try { mediaRecorder.stop(); } catch {}
         return;
       }
     }
-
     requestAnimationFrame(vadLoop);
   }
-
   requestAnimationFrame(vadLoop);
 }
 
@@ -309,7 +356,9 @@ async function handleUtterance(text) {
   addTurn('you', spokeLang, text);
   setState('translating', 'Translating…');
   const token = ++translateToken;
-  
+
+  turnMarks.translate_sent = performance.now();
+
   try {
     const resp = await fetch('/translate', {
       method: 'POST',
@@ -319,22 +368,36 @@ async function handleUtterance(text) {
     const data = await resp.json();
     if (!resp.ok) console.error('Translate error:', resp.status, data);
     if (token !== translateToken) return;
-    
+
     const translation = (data.translation || '').trim();
+
+    // ── Metrics: translate received ──
+    turnMarks.translate_received = performance.now();
+    turnMeta.translationLen = translation.length;
+    // ──────────────────────────────────
+
     if (!translation) {
+      turnMarks.turn_complete = performance.now();
+      sendMetrics();
       startListening();
       return;
     }
-    
+
     const outLang = /[一-鿿]/.test(translation) ? 'zh' : 'en';
     addTurn('trans', outLang, translation);
     speakStreaming(translation, outLang, () => {
+      turnMarks.turn_complete = performance.now();
+      sendMetrics();
       speaking = false;
       startListening();
     });
   } catch (err) {
     console.error('Translation error:', err);
+    turnMeta.error = 'translate_error';
+    turnMarks.translate_received = performance.now();
     addTurn('trans', expectLang === 'en' ? 'zh' : 'en', '(translation error)');
+    turnMarks.turn_complete = performance.now();
+    sendMetrics();
     speaking = false;
     startListening();
   }
@@ -349,7 +412,7 @@ function stopCurrentAudio() {
   try { speechSynthesis.cancel(); } catch {}
 }
 
-// ── Streaming TTS ───────────────────────────────────────────────────────────
+// ── Streaming TTS ──────────────────────────────────────────────────────────
 
 async function speakStreaming(text, lang, onDone) {
   speaking = true;
@@ -357,9 +420,12 @@ async function speakStreaming(text, lang, onDone) {
   stopCurrentAudio();
 
   if (!window.MediaSource || !MediaSource.isTypeSupported('audio/mpeg')) {
+    turnMeta.fallback = true;
     speak(text, lang, onDone);
     return;
   }
+
+  turnMarks.tts_sent = performance.now();
 
   try {
     const mediaSource = new MediaSource();
@@ -381,33 +447,49 @@ async function speakStreaming(text, lang, onDone) {
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          if (sb.updating) await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
+          if (sb.updating) await new Promise((r) => sb.addEventListener('updateend', r, { once: true }));
           sb.appendBuffer(value);
         }
-        if (sb.updating) await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
+        if (sb.updating) await new Promise((r) => sb.addEventListener('updateend', r, { once: true }));
         mediaSource.endOfStream();
 
-        audio.onended = () => { stopCurrentAudio(); onDone(); };
-        audio.onerror = () => { stopCurrentAudio(); onDone(); };
+        audio.onended = () => {
+          stopCurrentAudio();
+          onDone();
+        };
+        audio.onerror = () => {
+          stopCurrentAudio();
+          onDone();
+        };
         await audio.play();
+        // ── Metrics: streaming TTS played ──
+        turnMarks.tts_played = performance.now();
+        turnMeta.ttsMode = 'streaming';
+        // ─────────────────────────────────────
         log('Streaming TTS started');
       } catch (err) {
         log('Streaming TTS error, falling back: ' + err.message);
+        turnMeta.fallback = true;
         stopCurrentAudio();
         speak(text, lang, onDone);
       }
     });
   } catch (err) {
     log('MediaSource error, falling back: ' + err.message);
+    turnMeta.fallback = true;
     speak(text, lang, onDone);
   }
 }
 
-// Batch TTS fallback
+// ── Batch TTS ───────────────────────────────────────────────────────────────
+
 async function speak(text, lang, onDone) {
   speaking = true;
   setState('speaking', 'Speaking…');
   stopCurrentAudio();
+
+  turnMarks.tts_sent = performance.now();
+
   try {
     const resp = await fetch('/tts', {
       method: 'POST',
@@ -419,9 +501,19 @@ async function speak(text, lang, onDone) {
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
       currentAudio = audio;
-      audio.onended = () => { stopCurrentAudio(); onDone(); };
-      audio.onerror = () => { stopCurrentAudio(); onDone(); };
+      audio.onended = () => {
+        stopCurrentAudio();
+        onDone();
+      };
+      audio.onerror = () => {
+        stopCurrentAudio();
+        onDone();
+      };
       await audio.play();
+      // ── Metrics: batch TTS played ──
+      turnMarks.tts_played = performance.now();
+      turnMeta.ttsMode = 'batch';
+      // ─────────────────────────────────
       log('Playing via ElevenLabs (batch)');
       return;
     }
@@ -429,8 +521,11 @@ async function speak(text, lang, onDone) {
   } catch (e) {
     log('ElevenLabs TTS error, using browser speech: ' + e.message);
   }
+  turnMeta.fallback = true;
   speakBrowser(text, lang, onDone);
 }
+
+// ── Browser SpeechSynthesis (last resort) ───────────────────────────────────
 
 function speakBrowser(text, lang, onDone) {
   const synth = window.speechSynthesis;
@@ -439,10 +534,18 @@ function speakBrowser(text, lang, onDone) {
   utter.lang = lang === 'zh' ? 'zh-CN' : 'en-US';
   utter.rate = 1.0;
   const voices = synth.getVoices();
-  const match = voices.find(v => v.lang.startsWith(lang === 'zh' ? 'zh' : 'en'));
-  if (match) { utter.voice = match; }
-  utter.onend = () => onDone();
-  utter.onerror = () => onDone();
+  const match = voices.find((v) => v.lang.startsWith(lang === 'zh' ? 'zh' : 'en'));
+  if (match) utter.voice = match;
+  utter.onend = () => {
+    // ── Metrics: browser TTS played ──
+    turnMarks.tts_played = performance.now();
+    turnMeta.ttsMode = 'browser';
+    // ────────────────────────────────────
+    onDone();
+  };
+  utter.onerror = () => {
+    onDone();
+  };
   synth.speak(utter);
 }
 

@@ -94,7 +94,15 @@ export interface MetricsSnapshot {
 /** Browser-sent timing event */
 export interface BrowserTimingEvent {
   sessionId: string;
-  marks: Record<string, number>;
+  marks: {
+    turn_start?: number;
+    stt_received?: number;
+    translate_sent?: number;
+    translate_received?: number;
+    tts_sent?: number;
+    tts_played?: number;
+    turn_complete?: number;
+  };
   sourceLang: 'en' | 'zh';
   targetLang: 'en' | 'zh';
   transcriptLen: number;

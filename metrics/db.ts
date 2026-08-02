@@ -26,7 +26,6 @@ export function openDb(): Database.Database {
   _db = new Database(DB_PATH);
   _db.pragma('journal_mode = WAL');
   _db.pragma('synchronous = NORMAL');
-  _db.pragma('foreign_keys = ON');
   runMigrations(_db);
   return _db;
 }
@@ -50,7 +49,7 @@ function runMigrations(db: Database.Database): void {
       );
       CREATE TABLE IF NOT EXISTS turns (
         id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id         TEXT NOT NULL REFERENCES sessions(id),
+        session_id         TEXT NOT NULL,
         turn_number        INTEGER NOT NULL,
         source_lang        TEXT NOT NULL,
         target_lang        TEXT NOT NULL,
