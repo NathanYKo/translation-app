@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>Translator Monitor</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:#0e1116;color:#cdd6f4;
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  padding:20px;max-width:960px;margin:0 auto;
+}
+h1{font-size:20px;color:#7aa2f7;margin-bottom:4px}
+.sub{font-size:13px;color:#6b7280;margin-bottom:20px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px}
+.card{
+  background:#151920;border:1px solid #1e2430;border-radius:10px;padding:14px;
+  display:flex;flex-direction:column;gap:4px;
+}
+.card .label{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#6b7280}
+.card .val{font-size:24px;font-weight:600;font-variant-numeric:tabular-nums}
+.card .subval{font-size:12px;color:#6b7280}
+.val.green{color:#3ddc84}
+.val.blue{color:#7aa2f7}
+.val.orange{color:#ffb454}
+.val.red{color:#f7768e}
+.val.white{color:#e6e6e6}
+.bar{height:6px;border-radius:3px;background:#1e2430;overflow:hidden;margin-top:4px}
+.bar .fill{height:100%;border-radius:3px;transition:width .3s ease}
+.bar .fill.green{background:#3ddc84}
+.bar .fill.blue{background:#7aa2f7}
+.bar .fill.orange{background:#ffb454}
+.bar .fill.red{background:#f7768e}
+.bar .fill.grad{background:linear-gradient(90deg,#3ddc84,#7aa2f7 60%,#f7768e)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:#6b7280;font-weight:500;padding:6px 8px;border-bottom:1px solid #1e2430}
+td{padding:6px 8px;border-bottom:1px solid #1e2430}
+.err-type{color:#f7768e}
+.section-title{font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:#6b7280;margin:16px 0 8px}
+.lang-bar{display:flex;height:20px;border-radius:4px;overflow:hidden;margin-top:6px}
+.lang-bar .en{background:#3ddc84;transition:width .3s ease}
+.lang-bar .zh{background:#ffb454;transition:width .3s ease}
+.lang-legend{display:flex;gap:16px;margin-top:6px;font-size:12px;color:#6b7280}
+.lang-legend span{display:flex;align-items:center;gap:4px}
+.lang-legend .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.dot.green{background:#3ddc84}
+.dot.orange{background:#ffb454}
+.error{color:#f7768e;font-size:14px}
+</style>
+</head>
+<body>
+<h1>📊 Translator Monitor</h1>
+<div class="sub" id="statusline">Connecting…</div>
+
+<div class="grid" id="counters"></div>
+<div class="grid" id="latency"></div>
+<div class="grid" id="quality"></div>
+
+<div class="section-title">Language Direction</div>
+<div id="langContainer"></div>
+
+<div class="section-title">Recent Errors</div>
+<table id="errorsTable"><thead><tr><th>Type</th><th>Count</th></tr></thead><tbody></tbody></table>
+
+<script>
+const $ = id => document.getElementById(id);
+const counters = $('counters');
+const latency = $('latency');
+const quality = $('quality');
+const langContainer = $('langContainer');
+const errorsBody = document.querySelector('#errorsTable tbody');
+const statusline = $('statusline');
+
+function card(label, val, cls = 'white', subval = '') {
+  return `<div class="card"><div class="label">${label}</div><div class="val ${cls}">${val}</div>${subval ? `<div class="subval">${subval}</div>` : ''}</div>`;
+}
+
+function barCard(label, val, pct, color) {
+  return `<div class="card"><div class="label">${label}</div><div class="val white">${val}</div><div class="bar"><div class="fill ${color}" style="width:${Math.min(pct,100)}%"></div></div></div>`;
+}
+
+async function poll() {
+  try {
+    const resp = await fetch('/api/metrics');
+    const d = await resp.json();
+    render(d);
+    statusline.textContent = `Last updated: ${new Date().toLocaleTimeString()} · Uptime: ${d.uptimeHours.toFixed(1)}h · DB: ${d.metricsOk ? '✅' : '❌'}`;
+    statusline.style.color = d.metricsOk ? '#6b7280' : '#f7768e';
+  } catch(e) {
+    statusline.textContent = '⚠️ Cannot reach server';
+    statusline.style.color = '#f7768e';
+  }
+}
+
+function render(d) {
+  // Counters
+  counters.innerHTML =
+    card('Sessions Today', d.sessionsToday, 'blue') +
+    card('Turns Today', d.turnsToday, 'green') +
+    card('Active Sessions', d.activeSessions, 'orange') +
+    card('Error Rate', d.errorRatePct.toFixed(1) + '%', d.errorRatePct > 5 ? 'red' : 'green');
+
+  // Latency
+  const lat = d.avgLatencyMs;
+  const maxLat = Math.max(lat.stt, lat.translate, lat.tts, lat.e2e, 1);
+  latency.innerHTML =
+    barCard('STT', lat.stt + 'ms', (lat.stt / maxLat) * 100, 'blue') +
+    barCard('Translate', lat.translate + 'ms', (lat.translate / maxLat) * 100, 'green') +
+    barCard('TTS', lat.tts + 'ms', (lat.tts / maxLat) * 100, 'orange') +
+    barCard('End-to-End', lat.e2e + 'ms', (lat.e2e / maxLat) * 100, 'grad');
+
+  // Quality
+  quality.innerHTML =
+    card('Streaming TTS', d.streamingTtsPct.toFixed(1) + '%', d.streamingTtsPct > 50 ? 'green' : 'orange') +
+    card('Fallback Rate', d.fallbackPct.toFixed(1) + '%', d.fallbackPct > 10 ? 'red' : 'green') +
+    card('Estimated Cost', '$' + d.costTodayEstimatedUsd.toFixed(6), 'white') +
+    card('Total Errors', d.errorsToday, d.errorsToday > 0 ? 'red' : 'green');
+
+  // Language direction
+  const total = d.enToZh + d.zhToEn;
+  const enPct = total > 0 ? (d.enToZh / total) * 100 : 50;
+  const zhPct = total > 0 ? (d.zhToEn / total) * 100 : 50;
+  langContainer.innerHTML =
+    `<div class="lang-bar"><div class="en" style="width:${enPct}%"></div><div class="zh" style="width:${zhPct}%"></div></div>
+     <div class="lang-legend"><span><span class="dot green"></span> EN→ZH ${d.enToZh}</span><span><span class="dot orange"></span> ZH→EN ${d.zhToEn}</span></div>`;
+
+  // Errors
+  if (d.topErrors && d.topErrors.length > 0) {
+    errorsBody.innerHTML = d.topErrors.map(e =>
+      `<tr><td class="err-type">${e.type}</td><td>${e.count}</td></tr>`
+    ).join('');
+  } else {
+    errorsBody.innerHTML = '<tr><td colspan="2" style="color:#6b7280">No errors today</td></tr>';
+  }
+}
+
+poll();
+setInterval(poll, 5000);
+</script>
+</body>
+</html>

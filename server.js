@@ -436,7 +436,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // Static files
-  const rel = urlPath === '/' ? '/index.html' : urlPath;
+  const rel = urlPath === '/' ? '/index.html' : urlPath === '/admin/monitor' ? '/admin/monitor.html' : urlPath;
   const safe = path.normalize(rel).replace(/^(\.\.[/\\])+/, '');
   const file = path.join(PUBLIC_DIR, safe);
   if (!file.startsWith(PUBLIC_DIR)) { res.writeHead(403); res.end('Forbidden'); return; }
