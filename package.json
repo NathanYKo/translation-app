@@ -4,6 +4,15 @@
   "description": "No-button realtime English<->Chinese voice translator: browser STT -> OpenRouter LLM -> browser TTS.",
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "build:metrics": "cd metrics && npx tsc",
+    "start": "npm run build:metrics && node server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.1.2",
+    "typescript": "^7.0.2"
   }
 }

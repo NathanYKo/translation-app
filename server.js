@@ -4,6 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connect as wsConnect, OPCODES } from './ws.js';
+import { MetricsCollector } from './metrics/dist/index.js';
+
+const metrics = new MetricsCollector();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 try {
@@ -68,9 +71,21 @@ function extractJSON(text) {
 
 function isCJK(s) { return /[一-鿿]/.test(s); }
 
+/** Rough estimate of audio duration in seconds from byte size (Opus ~16 kbps) */
+function estimateAudioDuration(bytes) {
+  if (!bytes || bytes <= 0) return 0;
+  // Opus at ~16kbps: bytes / (16000/8) = bytes / 2000 ≈ seconds
+  return bytes / 2000;
+}
+
 // ── OpenRouter translate ────────────────────────────────────────────────────
 
 async function translate(text) {
+  const start = Date.now();
+  let success = false;
+  let inputChars = text.length;
+  let outputChars = 0;
+  let errorType = null;
   const resp = await fetch(OR_URL, {
     method: 'POST',
     headers: {
@@ -89,11 +104,19 @@ async function translate(text) {
   });
   if (!resp.ok) {
     const errText = await resp.text().catch(() => '');
-    throw new Error(`OpenRouter ${resp.status}: ${errText.slice(0, 200)}`);
+    const error = new Error(`OpenRouter ${resp.status}: ${errText.slice(0, 200)}`);
+    errorType = 'server_error';
+    const latency = Date.now() - start;
+    metrics.recordApiCall({ provider: 'openrouter', operation: 'translate', success: false, latencyMs: latency, inputChars, outputChars: 0, audioSeconds: 0, audioBytes: 0, errorType, errorDetail: `${resp.status}` });
+    throw error;
   }
   const data = await resp.json();
   const content = data?.choices?.[0]?.message?.content ?? '';
+  outputChars = content.length;
   const parsed = extractJSON(content);
+  success = true;
+  const latency = Date.now() - start;
+  metrics.recordApiCall({ provider: 'openrouter', operation: 'translate', success: true, latencyMs: latency, inputChars, outputChars, audioSeconds: 0, audioBytes: 0, errorType: null, errorDetail: null });
   if (parsed && typeof parsed.translation === 'string') {
     return { source: parsed.source === 'zh' ? 'zh' : 'en', translation: parsed.translation.trim() };
   }
@@ -105,6 +128,10 @@ async function translate(text) {
 // ── ElevenLabs TTS ──────────────────────────────────────────────────────────
 
 async function textToSpeech(text) {
+  const start = Date.now();
+  let success = false;
+  let errorType = null;
+  let audioBytes = 0;
   const resp = await fetch(EL_URL, {
     method: 'POST',
     headers: { 'xi-api-key': EL_API_KEY, 'Content-Type': 'application/json' },
@@ -112,14 +139,27 @@ async function textToSpeech(text) {
   });
   if (!resp.ok) {
     const errText = await resp.text().catch(() => '');
+    errorType = 'server_error';
+    const latency = Date.now() - start;
+    metrics.recordApiCall({ provider: 'elevenlabs', operation: 'tts', success: false, latencyMs: latency, inputChars: text.length, outputChars: 0, audioSeconds: 0, audioBytes: 0, errorType, errorDetail: `${resp.status}` });
     throw new Error(`ElevenLabs ${resp.status}: ${errText.slice(0, 200)}`);
   }
-  return Buffer.from(await resp.arrayBuffer());
+  const buf = Buffer.from(await resp.arrayBuffer());
+  audioBytes = buf.length;
+  success = true;
+  const latency = Date.now() - start;
+  metrics.recordApiCall({ provider: 'elevenlabs', operation: 'tts', success: true, latencyMs: latency, inputChars: text.length, outputChars: text.length, audioSeconds: 0, audioBytes, errorType: null, errorDetail: null });
+  return buf;
 }
 
 // ── Deepgram STT (batch fallback) ───────────────────────────────────────────
 
 async function speechToText(audioBuffer, lang) {
+  const start = Date.now();
+  let success = false;
+  let errorType = null;
+  const audioBytes = audioBuffer.length;
+  const audioSeconds = estimateAudioDuration(audioBytes);
   const langMap = { en: 'en', zh: 'zh-CN' };
   const params = new URLSearchParams({ model: 'nova-2', language: langMap[lang] || 'en', smart_format: 'true', punctuate: 'true' });
   const resp = await fetch(`https://api.deepgram.com/v1/listen?${params}`, {
@@ -129,17 +169,25 @@ async function speechToText(audioBuffer, lang) {
   });
   if (!resp.ok) {
     const errText = await resp.text().catch(() => '');
+    errorType = 'server_error';
+    const latency = Date.now() - start;
+    metrics.recordApiCall({ provider: 'deepgram', operation: 'stt', success: false, latencyMs: latency, inputChars: 0, outputChars: 0, audioSeconds, audioBytes, errorType, errorDetail: `${resp.status}` });
     throw new Error(`Deepgram ${resp.status}: ${errText.slice(0, 200)}`);
   }
   const data = await resp.json();
-  return (data?.results?.channels?.[0]?.alternatives?.[0]?.transcript || '').trim();
+  const transcript = (data?.results?.channels?.[0]?.alternatives?.[0]?.transcript || '').trim();
+  success = true;
+  const latency = Date.now() - start;
+  metrics.recordApiCall({ provider: 'deepgram', operation: 'stt', success: true, latencyMs: latency, inputChars: 0, outputChars: transcript.length, audioSeconds, audioBytes, errorType: null, errorDetail: null });
+  return transcript;
 }
 
 // ── Streaming STT via SSE + fetch (browser-friendly, no WebSocket needed) ──
 
-const sttSessions = new Map();  // sessionId → { dgConn, res }
+const sttSessions = new Map();  // sessionId → { dgConn, res, startTime, lang }
 
 async function startSttSession(req, res, lang) {
+  const sttStartTime = Date.now();
   const sessionId = crypto.randomUUID();
   const langMap = { en: 'en', zh: 'zh-CN' };
   const params = new URLSearchParams({ 
@@ -158,7 +206,7 @@ async function startSttSession(req, res, lang) {
   const dgConn = await wsConnect(dgUrl, { Authorization: `Token ${DG_API_KEY}` });
   console.log(`[stt] session ${sessionId} Deepgram connected`);
 
-  sttSessions.set(sessionId, { dgConn, res });
+  sttSessions.set(sessionId, { dgConn, res, startTime: sttStartTime, lang });
 
   // Send session ID to browser
   res.write(`data: ${JSON.stringify({ type: 'session', sessionId })}\n\n`);
@@ -177,6 +225,10 @@ async function startSttSession(req, res, lang) {
       }
       if (speechFinal) {
         res.write(`data: ${JSON.stringify({ type: 'final', text: transcript })}\n\n`);
+        // Record streaming STT metrics
+        const sttLatency = Date.now() - sttStartTime;
+        const audioSeconds = estimateAudioDuration(0); // rough: use latency as proxy
+        metrics.recordApiCall({ provider: 'deepgram', operation: 'stt_streaming', success: true, latencyMs: sttLatency, inputChars: 0, outputChars: transcript.length, audioSeconds, audioBytes: 0, errorType: null, errorDetail: null });
         cleanup();
       }
     } catch {}
@@ -185,6 +237,8 @@ async function startSttSession(req, res, lang) {
   dgConn.on('close', () => cleanup());
   dgConn.on('error', (err) => {
     console.error(`[stt] session ${sessionId} Deepgram error:`, err.message);
+    const sttLatency = Date.now() - sttStartTime;
+    metrics.recordApiCall({ provider: 'deepgram', operation: 'stt_streaming', success: false, latencyMs: sttLatency, inputChars: 0, outputChars: 0, audioSeconds: 0, audioBytes: 0, errorType: 'server_error', errorDetail: err.message });
     if (!res.writableEnded) res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`);
     cleanup();
   });
@@ -216,12 +270,20 @@ const server = http.createServer(async (req, res) => {
       const raw = await readBody(req);
       const { text } = JSON.parse(raw.toString() || '{}');
       if (!text || !text.trim()) { sendJSON(res, 200, { source: 'en', translation: '' }); return; }
+      // Track session from req
+      const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+      // beginSession is idempotent-ish but we don't persist session id per request here
       sendJSON(res, 200, await translate(text));
     } catch (e) { sendJSON(res, 502, { error: e.message }); }
     return;
   }
 
-  // POST /stt  (batch fallback)
+  // GET /api/metrics
+  if (req.method === 'GET' && urlPath === '/api/metrics') {
+    metrics.flush();
+    sendJSON(res, 200, metrics.snapshot());
+    return;
+  }
   if (req.method === 'POST' && urlPath === '/stt') {
     if (!DG_API_KEY) { sendJSON(res, 500, { error: 'DEEPGRAM_API_KEY not set' }); return; }
     try {
@@ -358,6 +420,10 @@ server.listen(PORT, () => {
   else console.log(`  ElevenLabs: ${EL_VOICE_ID} / ${EL_MODEL}`);
   warmUpConnections();
 });
+
+// Graceful shutdown
+process.on('SIGINT', () => { console.log('\nShutting down...'); metrics.shutdown(); process.exit(0); });
+process.on('SIGTERM', () => { metrics.shutdown(); process.exit(0); });
 
 async function warmUpConnections() {
   const jobs = [];
