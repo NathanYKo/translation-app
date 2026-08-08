@@ -149,7 +149,8 @@ server.listen(PORT, () => {
   console.log(`Realtime translator listening on http://localhost:${PORT}`);
   console.log(`  Gateway proxy → ${GATEWAY_URL}/offer`);
   console.log('  Start the gateway:  cd gateway && python gateway.py');
-  console.log('  Start the model:    cd model && python server.py --mock (or --model Qwen/Qwen2.5-Omni-7B)');
+  console.log('  Start the model:    pip install vllm-omni && vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8765');
+  console.log('  (or --mock: cd model && python server.py --mock)');
 });
 
 // Graceful shutdown

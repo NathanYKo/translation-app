@@ -1,4 +1,11 @@
-"""Model server: wraps Qwen2.5-Omni behind a WebSocket.  Run with --mock to test without GPU."""
+"""Model server (deprecated): wraps Qwen2.5-Omni behind a WebSocket.
+
+Prefer vllm-omni instead:
+  pip install vllm-omni
+  vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8765
+
+This file is kept for `--mock` testing (no GPU) and as a reference.
+"""
 import argparse, asyncio, json, os, tempfile
 import numpy as np
 import websockets
