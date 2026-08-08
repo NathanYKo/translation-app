@@ -1,3 +1,8 @@
+# vllm-omni is the recommended backend (replaces this file entirely)
+#   pip install vllm-omni
+#   vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8765
+#
+# These deps are only needed if running this server directly (--mock or --model):
 torch>=2.5
 transformers>=4.50
 qwen-omni-utils>=0.1
